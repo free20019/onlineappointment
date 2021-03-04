@@ -1,0 +1,814 @@
+package com.twkf.service;
+
+
+import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
+import com.twkf.annotation.RedissonLock;
+import com.twkf.dao.ManageConfigureDao;
+import com.twkf.domain.*;
+import com.twkf.mapper.*;
+
+import com.twkf.util.SystemCode;
+import com.twkf.vo.AppointVo;
+import com.twkf.vo.CancelAppointVo;
+import com.twkf.vo.CompanyVo;
+import com.twkf.vo.Result;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.data.redis.core.BoundHashOperations;
+import org.springframework.data.redis.core.BoundSetOperations;
+import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.stereotype.Service;
+
+import java.text.ParseException;
+import java.text.SimpleDateFormat;
+import java.util.*;
+import java.util.concurrent.TimeUnit;
+
+
+/**
+ * @author: xianlehuang
+ * @Description:
+ * @date: 2021/1/27 - 15:13
+ */
+@Service
+@Slf4j
+public class AppointService {
+
+    @Autowired
+    CompanyMapper companyMapper;
+
+    @Autowired
+    ManageConfigureMapper manageConfigureMapper;
+
+    @Autowired
+    ManageConfigureDao manageConfigureDao;
+
+    @Autowired
+    AppointMapper appointMapper;
+
+    @Autowired
+    ConfigureTimeSlotMapper configureTimeSlotMapper;
+    
+    @Autowired
+    UserService userService;
+
+    @Autowired
+    AsyncService asyncService;
+
+    @Autowired
+    RedisTemplate redisTemplate;
+
+    public Result getAllCompany() {
+        boolean hasKey = redisTemplate.hasKey(Company.class.getName());
+        List<Company> companies;
+        if(hasKey == true){
+            companies = redisTemplate.boundHashOps(Company.class.getName()).values();
+        }else{
+            companies = getAllCompanyDB(1);
+
+        }
+        return Result.success(companies);
+
+    }
+
+    //查询所有公司 from数据库
+    @RedissonLock
+    public List<Company> getAllCompanyDB(Integer type) {
+        List<Company> companies;
+        if(type == 1){
+            //先从redis获取
+            companies = redisTemplate.boundHashOps(Company.class.getName()).values();
+            boolean hasKey = redisTemplate.hasKey(Company.class.getName());
+            if(hasKey == true){
+                return companies;
+            }
+        }
+        SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd");
+        Date date = new Date();
+        String stime = sdf.format(new Date(date.getTime() + SystemCode.APPOINT_START_DAY*24*60*60*1000));
+        String etime = sdf.format(new Date(date.getTime() + SystemCode.APPOINT_END_DAY*24*60*60*1000));
+        //从数据库获取
+        companies = companyMapper.selectList(new QueryWrapper<Company>()
+                .and(wrapper -> wrapper.eq("company_type", 1).or().eq("company_type", 2))
+                .isNotNull("lon")
+                .isNotNull("lat")
+                .orderByAsc("company_id")
+        );
+        List<ManageConfigure> manageConfigures = manageConfigureMapper
+                .selectList(new QueryWrapper<ManageConfigure>()
+                        .eq("fbtype", 0)
+                        .between("dbtime", stime, etime)
+                        .orderByAsc("company_id", "configure_time_type")
+                );
+
+        HashMap<Object, Object> map = new HashMap<>();
+        List<ConfigureTimeSlot> configureTimeSlots = getConfigureTimeSlot(1);
+        for (Company company : companies) {
+            Integer total = 0;
+            Integer count = 0;
+            Integer sessions = 0;
+//            Map<String, Integer> map = new LinkedHashMap<>();
+            for (ManageConfigure configure : manageConfigures) {
+                if(company.getCompanyId().equals(configure.getCompanyId())){
+                    for (ConfigureTimeSlot timeSlot : configureTimeSlots) {
+                        if(company.getCompanyType().equals(timeSlot.getCompanyType())&&configure.getConfigureTimeType().equals(timeSlot.getConfigureTimeType())){
+                            //判断是否是可预约的场次
+                            if(isCanCalculate(configure, timeSlot)){
+                                count = count + configure.getSurplusNumber();
+                                total = total + configure.getOrderNumber();
+                                sessions = sessions + 1;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            company.setCount(count);
+            company.setTotal(total);
+            company.setSessions(sessions);
+//            company.setMap(map);
+            //把公司信息放入redis
+            map.put(company.getCompanyId(), company);
+        }
+        redisTemplate.delete(Company.class.getName());
+        redisTemplate.boundHashOps(Company.class.getName()).putAll(map);
+        //设置redis公司信息过期时间
+        redisTemplate.expire(Company.class.getName(), SystemCode.COMPANY_OVERTIME*60, TimeUnit.SECONDS);
+        return companies;
+    }
+
+    //判断是否是可预约的场次
+    private boolean isCanCalculate(ManageConfigure configure, ConfigureTimeSlot timeSlot) {
+        Boolean isCan  =false;
+        SimpleDateFormat sdf1 = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+        SimpleDateFormat sdf2= new SimpleDateFormat("yyyy-MM-dd");
+        String endTime = timeSlot.getEndTime();
+        Date dbTime = configure.getDbtime();
+
+        String today = sdf2.format(new Date());
+        if(today.equals(sdf2.format(dbTime))){
+            /*秒数差*/
+            Date compareDate = null;
+            try {
+                compareDate = sdf1.parse(today+" "+endTime);
+            } catch (ParseException e) {
+                e.printStackTrace();
+            }
+            isCan = compareDate.getTime() > System.currentTimeMillis()+SystemCode.USER_APPOINT_OVERTIME*60*1000;
+        }else if(dbTime.getTime() > System.currentTimeMillis()){
+            isCan = true;
+        }
+        return isCan;
+    }
+
+
+    public Result<List<ManageConfigure>> getCompanyDetails(String companyId) {
+        boolean hasKey = redisTemplate.hasKey(ManageConfigure.class.getName());
+        List<ManageConfigure> configures = redisTemplate.boundHashOps(ManageConfigure.class.getName()).values();
+        if(hasKey == false){
+            configures = getCompanyDetailDB(null, 1);
+        }
+        SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd");
+        //遍历所有的发布预约信息 查询用户所需公司的信息
+        List<ManageConfigure> result = new ArrayList<>();
+        for (ManageConfigure configure : configures) {
+            if(companyId.equals(configure.getCompanyId())){
+                result.add(configure);
+            }
+        }
+        return Result.success(result);
+    }
+
+    public Result getCompanyDetail(CompanyVo companyVo) {
+        boolean hasKey = redisTemplate.hasKey(ManageConfigure.class.getName());
+        List<ManageConfigure> configures = redisTemplate.boundHashOps(ManageConfigure.class.getName()).values();
+        if(hasKey == false){
+            configures = getCompanyDetailDB(companyVo, 1);
+        }
+        SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd");
+        //遍历所有的发布预约信息 查询用户所需公司的信息
+        List<ManageConfigure> result = new ArrayList<>();
+        for (ManageConfigure configure : configures) {
+            if(companyVo.getCompanyId().equals(configure.getCompanyId())&&configure.getDbtime()!=null&&companyVo.getTime().equals(sdf.format(configure.getDbtime()))){
+                result.add(configure);
+            }
+        }
+        return Result.success(result);
+    }
+
+
+    public Result<ManageConfigure> getCompanyDetailById(String id) {
+        boolean hasKey = redisTemplate.hasKey(ManageConfigure.class.getName());
+        List<ManageConfigure> configures = redisTemplate.boundHashOps(ManageConfigure.class.getName()).values();
+        if(hasKey == false){
+            configures = getCompanyDetailDB(null, 1);
+        }
+        SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd");
+        //遍历所有的发布预约信息 查询用户所需公司的信息
+        ManageConfigure result = null;
+        for (ManageConfigure configure : configures) {
+            if(id.equals(configure.getId())){
+                result= configure;
+                break;
+            }
+        }
+        return Result.success(result);
+    }
+
+    //查询公司发布预约信息 from数据库  有效时间内
+    //type 0:从数据库查询有效时间段的数据并存放到redis 1:从redis查询有效时间段的数据，查不到查数据库  查询 2:从数据库中查询今日发布的信息不放入redis
+    @RedissonLock
+    public List<ManageConfigure> getCompanyDetailDB(CompanyVo companyVo, Integer type) {
+        List<ManageConfigure> manageConfigures;
+        SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd");
+        Date date = new Date();
+        String stime = "";
+        String etime = "";
+        //定时器中用户队列使用,不存放在redis中
+        if(type == 2){
+            stime = sdf.format(new Date(date.getTime()));
+            etime = sdf.format(new Date(date.getTime()));
+
+        }else{
+            stime = sdf.format(new Date(date.getTime() + SystemCode.APPOINT_START_DAY*24*60*60*1000));
+            etime = sdf.format(new Date(date.getTime() + SystemCode.APPOINT_END_DAY*24*60*60*1000));
+        }
+        //用户直接查询，先在redis中看看存在否
+        if(type == 1){
+            if(companyVo!=null){
+                //日期在预约天数限制之外
+                if(Long.parseLong(stime.replaceAll("-",""))>Long.parseLong(companyVo.getTime().replaceAll("-",""))
+                        ||Long.parseLong(etime.replaceAll("-",""))<Long.parseLong(companyVo.getTime().replaceAll("-",""))){
+                    return new ArrayList<ManageConfigure>();
+                }
+            }
+            //先从redis获取
+            manageConfigures = redisTemplate.boundHashOps(ManageConfigure.class.getName()).values();
+            boolean hasKey = redisTemplate.hasKey(ManageConfigure.class.getName());
+            if(hasKey == true){
+                return manageConfigures;
+            }
+        }
+        //从数据库获取
+        manageConfigures = manageConfigureMapper
+                .selectList(new QueryWrapper<ManageConfigure>()
+                        .eq("fbtype", 0)
+                        .between("dbtime", stime, etime)
+                        .orderByAsc("company_id","configure_time_type")
+                );
+        //定时器中用户队列使用,不存放在redis中
+        if(type != 2){
+            List<ConfigureTimeSlot> configureTimeSlots = getConfigureTimeSlot(1);
+            List<Company> companies = getAllCompanyDB(1);
+            HashMap<Object, Object> map = new HashMap<>();
+            for (ManageConfigure configure : manageConfigures) {
+                //把公司发布预约信息放入redis
+//                map.put(configure.getId(), configure);
+                for (Company company : companies) {
+                    if(company.getCompanyId().equals(configure.getCompanyId())){
+                        for (ConfigureTimeSlot timeSlot : configureTimeSlots) {
+                            if(company.getCompanyType().equals(timeSlot.getCompanyType())&&configure.getConfigureTimeType().equals(timeSlot.getConfigureTimeType())){
+                                //判断是否是可预约的场次
+                                if(isCanCalculate(configure, timeSlot)){
+                                    map.put(configure.getId(), configure);
+                                    break;
+                                }else{
+                                    configure.setSurplusNumber(0);
+                                    map.put(configure.getId(), configure);
+                                    break;
+                                }
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+            redisTemplate.delete(ManageConfigure.class.getName());
+            redisTemplate.boundHashOps(ManageConfigure.class.getName()).putAll(map);
+            //设置redis公司发布预约信息过期时间
+            redisTemplate.expire(ManageConfigure.class.getName(), SystemCode.MANAGE_CONFIGURE_OVERTIME*60, TimeUnit.SECONDS);
+        }
+        return manageConfigures;
+    }
+
+    //查询公司发布预约信息 from数据库  所有时间的
+    @RedissonLock
+    public List<ManageConfigure> getCompanyAllDetailDB(Integer type) {
+        List<ManageConfigure> manageConfigures;
+        //用户直接查询，先在redis中看看存在否
+        if(type == 1){
+            //先从redis获取
+            manageConfigures = redisTemplate.boundHashOps(ManageConfigure.class.getName()+"_history").values();
+            boolean hasKey = redisTemplate.hasKey(ManageConfigure.class.getName()+"_history");
+            if(hasKey == true){
+                return manageConfigures;
+            }
+        }
+        //从数据库获取
+        manageConfigures = manageConfigureMapper
+                .selectList(new QueryWrapper<ManageConfigure>()
+                        .eq("fbtype", 0)
+                        .orderByAsc("company_id","configure_time_type")
+                );
+        //定时器中用户队列使用,不存放在redis中
+        if(type != 2){
+            HashMap<Object, Object> map = new HashMap<>();
+            for (ManageConfigure configure : manageConfigures) {
+                //把公司发布预约信息放入redis
+                map.put(configure.getId(), configure);
+            }
+            redisTemplate.delete(ManageConfigure.class.getName()+"_history");
+            redisTemplate.boundHashOps(ManageConfigure.class.getName()+"_history").putAll(map);
+            //设置redis公司发布预约信息过期时间
+            redisTemplate.expire(ManageConfigure.class.getName()+"_history", SystemCode.MANAGE_CONFIGURE_OVERTIME*60, TimeUnit.SECONDS);
+        }
+        return manageConfigures;
+    }
+
+
+
+    @RedissonLock(lockIndex = 0, isCommon = true, commonValue = "appointOrCancel")
+    public Result userAppoint(String phone, AppointVo appointVo) {
+        while(redisTemplate.hasKey(SystemCode.STOP_APPOINT)){
+        }
+        String configureId = appointVo.getId();
+        String appointVoPhone = appointVo.getPhone();
+        String code = appointVo.getCode();
+        String username = appointVo.getUsername();
+        //1,判断有无该场次
+        ManageConfigure configure = getCompanyDetailById(configureId).getObj();
+        if(configure==null){
+            return Result.error("无该场次或该场次已过期！");
+        }
+        //2,判断有无预约数量
+        if(redisTemplate.boundListOps(SystemCode.APPOINT_PREFIX+configureId).size()==0){
+            //无‘预约记录id’提示该预约场次已经预约完了
+            return Result.error("该预约场次已无预约数了！");
+        }
+        //3,zookeeper 内存标记
+
+        log.info("用户预约："+appointVoPhone+"用户进入预约接口！！");
+        //4,判断用户的验证信息是否正确
+        Result result = userService.CheckPhoneCode(appointVoPhone, appointVo.getUsername(), appointVo.getCode(), 0);
+        if(result.getCode()!=200){
+            return result;
+        }
+        //5,判断‘预约id’是否在有效的时间段中
+        ReturnAppointResult appointResult = isUserAppoint(configure);
+        Company company = appointResult.getCompany();
+        ConfigureTimeSlot thisTimeSlot = appointResult.getTimeSlot();
+        if(company==null){
+            log.info("用户预约："+appointVoPhone+"该场预约公司信息为空:"+configure.getCompanyId());
+            return Result.error("该场预约公司信息为空!!");
+        }
+        if(thisTimeSlot==null){
+            log.info("用户预约："+appointVoPhone+"该场时间配置信息为空:"+configureId);
+            return Result.error("该场时间配置信息为空!!");
+        }
+        if(!appointResult.getIsCan()){
+            log.info("用户预约："+appointVoPhone+"用户预约需提前"+SystemCode.USER_APPOINT_OVERTIME/60+"小时:"+configureId);
+            return Result.error("用户预约需提前"+SystemCode.USER_APPOINT_OVERTIME/60+"小时!!");
+        }
+        //6,判断用户有没有预约过
+        //明日之后
+        BoundSetOperations userOps = redisTemplate.boundSetOps(SystemCode.USER_APPOINTED_PREFIX);
+        if(userOps.isMember(appointVoPhone)){
+            log.info("用户预约："+appointVoPhone+"用户已预约");
+            return Result.error("用户已预约！");
+        }else{
+            //今日
+            List<ConfigureTimeSlot> configureTimeSlots = getConfigureTimeSlot(1);
+            for (ConfigureTimeSlot timeSlot : configureTimeSlots) {
+                Boolean memberToday = redisTemplate.boundSetOps(SystemCode.TODAY_USER_APPOINTED_PREFIX+timeSlot.getCompanyType()+SystemCode.TODAY_USER_APPOINTED_TYPE+timeSlot.getConfigureTimeType()).isMember(appointVoPhone);
+                if(memberToday){
+                    log.info("用户预约："+appointVoPhone+"用户今日已预约！");
+                    return Result.error("用户今日已预约！");
+                }
+            }
+        }
+        //7,判断用户预约的次数
+        BoundHashOperations appointTwoOps = redisTemplate.boundHashOps(SystemCode.USER_APPOINT_RECORD_LIMIT);
+        Object user_is_limit = appointTwoOps.get(appointVoPhone);
+        if(Integer.parseInt(user_is_limit==null?"0":String.valueOf(user_is_limit))>=SystemCode.USER_LIMIT){
+            return Result.error("用户已预约"+SystemCode.USER_LIMIT+"次！");
+        }
+        //8,从redis队列中根据‘预约id’获取‘预约记录id’
+        String uuid = (String) redisTemplate.boundListOps(SystemCode.APPOINT_PREFIX+configureId).rightPop();
+        //9,判断有无‘预约记录id’了
+        if(uuid == null){
+            log.info("用户预约："+appointVoPhone+"该预约场次已无预约数了："+configureId);
+            //无‘预约记录id’提示该预约场次已经预约完了
+            return Result.error("该预约场次已无预约数了！");
+        }
+        //10,有‘预约记录id’,把用户phone放入redis中
+        if(appointResult.getIsToday()){
+            //今日
+            String todayKey = SystemCode.TODAY_USER_APPOINTED_PREFIX + thisTimeSlot.getCompanyType() + SystemCode.TODAY_USER_APPOINTED_TYPE + thisTimeSlot.getConfigureTimeType();
+            Boolean isHasToday = redisTemplate.hasKey(todayKey);
+            BoundSetOperations todayOps = redisTemplate.boundSetOps(todayKey);
+            if(todayOps.isMember(appointVoPhone)||todayOps.add(appointVoPhone) == 0){
+                //重新放入‘预约记录id’
+                redisTemplate.boundListOps(SystemCode.APPOINT_PREFIX+configureId).leftPush(uuid);
+                log.info("用户预约："+appointVoPhone+"该用户今日已预约！");
+                return Result.error("该用户今日已预约！");
+            }else{
+                if(!isHasToday){
+                    //设置过期时间
+                    long time = calculationTimeout(thisTimeSlot.getEndTime());
+                    redisTemplate.expire(todayKey, time, TimeUnit.SECONDS);
+                }
+            }
+        }else {
+            //明日之后
+            if(userOps.isMember(appointVoPhone)||userOps.add(appointVoPhone) == 0){
+                //重新放入‘预约记录id’
+                redisTemplate.boundListOps(SystemCode.APPOINT_PREFIX+configureId).leftPush(uuid);
+                log.info("用户预约："+appointVoPhone+"该用户已预约！");
+                return Result.error("该用户已预约！");
+            }
+        }
+        //11,用户预约次数加一
+        appointTwoOps.put(appointVoPhone, Integer.parseInt(user_is_limit==null?"0":user_is_limit.toString())+1);
+        //12,有‘预约记录id’,创建预约记录，并放入redis预约记录队列中
+        Appoint appoint = new Appoint();
+        appoint.setPhone(appointVoPhone);
+        appoint.setCode(code);
+        appoint.setUsername(username);
+        appoint.setConfigureId(configureId);
+        appoint.setCompanyId(configure.getCompanyId());
+        appoint.setAppointType("1");
+        appoint.setAppointTime(new Date());
+        appoint.setAppointId(uuid);
+        log.info("用户预约："+appointVoPhone+"用户抢到了预约信息id为"+appoint.getConfigureId()+":",appoint.toString());
+        log.warn("用户预约："+appointVoPhone+"用户抢到了预约信息id为"+appoint.getConfigureId()+":",appoint.toString());
+//        redisTemplate.boundListOps(SystemCode.SNATCH_APPOINTMENT_PREFIX).leftPush(appoint);
+        //13,通过另起线程执行redis预约记录队列中的数据，并返回成功
+        asyncService.dealAppointRecord(appoint, appointResult);
+        //14,验证码删除
+        redisTemplate.delete(SystemCode.CODE_PHONE_PREFIX + phone);
+
+        return Result.success();
+    }
+
+    //过期时间(秒)
+    private long calculationTimeout(String endTime) {
+        SimpleDateFormat sdf1 = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+        SimpleDateFormat sdf2= new SimpleDateFormat("yyyy-MM-dd");
+        Long seconds = 0L;
+        /*秒数差*/
+        String today = sdf2.format(new Date());
+        Date compareDate = null;
+        try {
+            compareDate = sdf1.parse(today+" "+endTime);
+        } catch (ParseException e) {
+            e.printStackTrace();
+        }
+        if(System.currentTimeMillis()<=compareDate.getTime()){
+            seconds = (((compareDate.getTime()) - System.currentTimeMillis()) / (1000));
+        }
+        return seconds;
+    }
+
+    private ReturnAppointResult isUserAppoint(ManageConfigure configure) {
+        SimpleDateFormat sdf1 = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+        SimpleDateFormat sdf2= new SimpleDateFormat("yyyy-MM-dd");
+        ReturnAppointResult result = new ReturnAppointResult();
+        boolean isCan = false;
+        boolean isToday = false;
+        String companyId = configure.getCompanyId();
+        String configureTimeType = configure.getConfigureTimeType();
+        Date dbtime = configure.getDbtime();
+        //获取公司
+        List<Company> companies = (List<Company>) getAllCompany().getObj();
+        List<ConfigureTimeSlot> configureTimeSlots = getConfigureTimeSlot(1);
+        String companyType = null;
+        //找到公司
+        for (Company company : companies) {
+            if(company.getCompanyId().equals(companyId)){
+                result.setCompany(company);
+                companyType = company.getCompanyType();
+                break;
+            }
+        }
+        //找到预约的时间段
+        Date compareDate = null;
+        for (ConfigureTimeSlot timeSlot : configureTimeSlots) {
+            if(timeSlot.getConfigureTimeType().equals(configureTimeType)&&timeSlot.getCompanyType().equals(companyType)){
+                //与当前时间比较
+                try {
+                    compareDate = sdf1.parse(sdf2.format(dbtime)+" "+timeSlot.getEndTime());
+                } catch (ParseException e) {
+                    e.printStackTrace();
+                }
+                result.setTimeSlot(timeSlot);
+                break;
+            }
+        }
+
+        if(compareDate != null){
+            isCan = compareDate.getTime() > System.currentTimeMillis()+SystemCode.USER_APPOINT_OVERTIME*60*1000;
+            isToday = sdf2.format(compareDate).equals(sdf2.format(new Date()));
+
+        }
+        result.setManageConfigure(configure);
+        result.setIsCan(isCan);
+        result.setIsToday(isToday);
+        return result;
+    }
+
+    @RedissonLock(lockIndex = 0)
+    public Result getUserAppointHistory(String phone) {
+        //预约信息
+        List<Appoint> appoints = getAllAppointDB(1);
+        //获取公司
+        List<Company> companies = (List<Company>) getAllCompany().getObj();
+        //获取公司发布预约信息
+        List<ManageConfigure> configures = getCompanyAllDetailDB( 1);
+        //时间配置
+        List<ConfigureTimeSlot> configureTimeSlots = getConfigureTimeSlot(1);
+        List<ReturnAppointResult> result = new ArrayList<>();
+        ReturnAppointResult returnAppointResult;
+        for (Appoint appoint : appoints) {
+            //判断是否为所查手机号
+            if(phone.equals(appoint.getPhone())){
+                returnAppointResult = new ReturnAppointResult();
+                returnAppointResult.setAppoint(appoint);
+                returnAppointResult.setCancelOvertime(SystemCode.CANCEL_APPOINT_OVERTIME);
+                for (Company company : companies) {
+                    //找到对应的公司
+                    if(company.getCompanyId().equals(appoint.getCompanyId())){
+                        returnAppointResult.setCompany(company);
+                        break;
+                    }
+                }
+                for (ManageConfigure configure : configures) {
+                    //找到对应的发布信息
+                    if(configure.getId().equals(appoint.getConfigureId())){
+                        for (ConfigureTimeSlot timeSlot : configureTimeSlots) {
+                            if(timeSlot.getConfigureTimeType().equals(configure.getConfigureTimeType())&&timeSlot.getCompanyType().equals(returnAppointResult.getCompany().getCompanyType())){
+                                returnAppointResult.setTimeSlot(timeSlot);
+                                break;
+                            }
+                        }
+                        //判断该场发布有无过期
+                        if((!"3".equals(appoint.getAppointType()))&&isOvertime(appoint.getId(), configure.getDbtime(), configure.getConfigureTimeType(), configure.getCompanyId())){
+                            returnAppointResult.getAppoint().setAppointType("3");
+                            //更新redis
+                            redisTemplate.boundHashOps(Appoint.class.getName()).put(appoint.getAppointId(), returnAppointResult.getAppoint());
+                            //更新预约记录到数据库
+                            Appoint appoint1 = new Appoint();
+                            appoint1.setAppointType("3");
+                            appoint1.setId(appoint.getId());
+                            asyncService.dealUpdateAppoint(appoint1);
+                        }
+                        returnAppointResult.setManageConfigure(configure);
+                        break;
+                    }
+                }
+                if(returnAppointResult.getCompany()==null||returnAppointResult.getManageConfigure()==null){
+                    log.info("预约记录："+"有预约记录但无‘公司’或‘发布信息’",returnAppointResult);
+                }
+                result.add(returnAppointResult);
+            }
+        }
+        return Result.success(result);
+    }
+
+    //判断是否过期
+    private boolean isOvertime(String id, Date dbtime, String configureTimeType, String companyId) {
+        SimpleDateFormat sdf1 = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+        SimpleDateFormat sdf2= new SimpleDateFormat("yyyy-MM-dd");
+        boolean isTrue = false;
+        List<ConfigureTimeSlot> configureTimeSlots = getConfigureTimeSlot(1);
+        //获取公司
+        List<Company> companies = (List<Company>) getAllCompany().getObj();
+        String companyType = null;
+        for (Company company : companies) {
+            if(company.getCompanyId().equals(companyId)){
+                companyType = company.getCompanyType();
+            }
+        }
+        Date compareDate = null;
+        for (ConfigureTimeSlot timeSlot : configureTimeSlots) {
+            if(timeSlot.getConfigureTimeType().equals(configureTimeType)&&timeSlot.getCompanyType().equals(companyType)){
+                //与当前时间比较
+                try {
+                    compareDate = sdf1.parse(sdf2.format(dbtime)+" "+timeSlot.getEndTime());
+                } catch (ParseException e) {
+                    e.printStackTrace();
+                }
+                break;
+            }
+        }
+        if(compareDate != null){
+            isTrue = compareDate.getTime() < System.currentTimeMillis();
+        }
+        return isTrue;
+    }
+
+    @RedissonLock
+    public List<Appoint> getAllAppointDB(Integer type) {
+        List<Appoint> appoints;
+        if(type == 1){
+            //先从redis获取
+            appoints = redisTemplate.boundHashOps(Appoint.class.getName()).values();
+            boolean hasKey = redisTemplate.hasKey(Appoint.class.getName());
+            if(hasKey == true){
+                return appoints;
+            }
+        }
+        //从数据库获取
+        appoints = appointMapper
+                .selectList(new QueryWrapper<Appoint>()
+                        .gt("appoint_type", 0)
+                        .orderByDesc("appoint_time")
+                );
+        HashMap<String, Object> map = new HashMap<>();
+        for (Appoint appoint : appoints) {
+            //把预约记录放入redis
+            map.put(appoint.getAppointId(), appoint);
+//            redisTemplate.boundHashOps(Appoint.class.getName()).put(appoint.getAppointId(), appoint);
+        }
+        redisTemplate.delete(Appoint.class.getName());
+        redisTemplate.boundHashOps(Appoint.class.getName()).putAll(map);
+        //设置redis预约记录过期时间
+        redisTemplate.expire(Appoint.class.getName(), SystemCode.APPOINT_RECORD_OVERTIME*60, TimeUnit.SECONDS);
+        return appoints;
+    }
+
+    //发布的时间配置
+    @RedissonLock
+    public List<ConfigureTimeSlot> getConfigureTimeSlot(Integer type) {
+        List<ConfigureTimeSlot> configureTimeSlots;
+        if(type == 1){
+            //先从redis获取
+            configureTimeSlots = redisTemplate.boundHashOps(ConfigureTimeSlot.class.getName()).values();
+            boolean hasKey = redisTemplate.hasKey(ConfigureTimeSlot.class.getName());
+            if(hasKey == true){
+                return configureTimeSlots;
+            }
+        }
+        //从数据库获取
+        configureTimeSlots = configureTimeSlotMapper.selectList(null);
+        HashMap<Object, Object> map = new HashMap<>();
+        for (ConfigureTimeSlot configureTimeSlot : configureTimeSlots) {
+            //把预约记录放入redis
+            map.put(configureTimeSlot.getId(), configureTimeSlot);
+        }
+        redisTemplate.delete(ConfigureTimeSlot.class.getName());
+        redisTemplate.boundHashOps(ConfigureTimeSlot.class.getName()).putAll(map);
+        //设置redis时间信息过期时间
+        redisTemplate.expire(ConfigureTimeSlot.class.getName(), SystemCode.CONFIGURE_TIME_SLOT_OVERTIME*60, TimeUnit.SECONDS);
+        return configureTimeSlots;
+    }
+
+    @RedissonLock(lockIndex = 0, isCommon = true, commonValue = "appointOrCancel")
+    public Result cancelUserAppoint(String phone, CancelAppointVo cancelAppointVo) {
+        while(redisTemplate.hasKey(SystemCode.STOP_APPOINT)){
+        }
+        String appointId = cancelAppointVo.getAppointId();
+        String code = cancelAppointVo.getCode();
+        log.info("取消预约："+phone+"用户进入取消预约接口！！");
+        //1,判断用户的验证信息是否正确
+        Result result = userService.CheckPhoneCode(phone, "", code, 1);
+        if(result.getCode()!=200){
+            return result;
+        }
+        //2,查询出这一条预约信息 判断手机号是否一样
+        Appoint appoint = getAppointByID(appointId, phone);
+        if(appoint==null){
+            log.info("取消预约："+phone+"无该条记录:"+appointId);
+            return Result.error("无该条记录!!");
+        }
+        if(!appoint.getPhone().equals(phone)){
+            log.info("取消预约："+phone+"手机号不一致错误:"+appoint.getPhone());
+            return Result.error("手机号不一致错误!!");
+        }
+        if("2".equals(appoint.getAppointType())||"3".equals(appoint.getAppointType())){
+            return Result.error("该预约‘已取消’或‘已过期’！！");
+        }
+        //3,判断是否可以取消预约
+        ReturnAppointResult appointResult = isCancelAppoint(appoint);
+        ManageConfigure manageConfigure = appointResult.getManageConfigure();
+        Company company = appointResult.getCompany();
+        ConfigureTimeSlot timeSlot = appointResult.getTimeSlot();
+        if(manageConfigure==null){
+            log.info("取消预约："+"该场预约配置信息为空:"+appointId);
+            return Result.error("该场预约配置信息为空!!");
+        }
+        if(company==null){
+            log.info("取消预约："+"该场预约公司信息为空:"+appointId);
+            return Result.error("该场预约公司信息为空!!");
+        }
+        if(timeSlot==null){
+            log.info("取消预约："+"该场时间配置信息为空:"+appointId);
+            return Result.error("该场时间配置信息为空!!");
+        }
+        if(!appointResult.getIsCan()){
+            log.info("取消预约："+"取消预约需提前"+SystemCode.CANCEL_APPOINT_OVERTIME/60+"小时:"+appointId);
+            return Result.error("取消预约需提前"+SystemCode.CANCEL_APPOINT_OVERTIME/60+"小时!!");
+        }
+        //4,redis中相关信息更新
+        //4.1,删除用户预约今日或者今日之后的
+        //是否是今天预约的
+        if(appointResult.getIsToday()){
+            //删除用户预约今日的
+            redisTemplate.boundSetOps(SystemCode.TODAY_USER_APPOINTED_PREFIX+company.getCompanyType()+SystemCode.TODAY_USER_APPOINTED_TYPE+manageConfigure.getConfigureTimeType()).remove(phone);
+        }else {
+            redisTemplate.boundSetOps(SystemCode.USER_APPOINTED_PREFIX).remove(phone);
+        }
+        //4.2,用户预约次数减一
+        BoundHashOperations appointTwoOps = redisTemplate.boundHashOps(SystemCode.USER_APPOINT_RECORD_LIMIT);
+        appointTwoOps.put(phone, Integer.parseInt(appointTwoOps.get(phone)==null?"0":appointTwoOps.get(phone).toString())-1);
+
+        //5,通过另起线程执行redis预约记录队列中的数据，并返回成功
+        asyncService.dealCancelAppointRecord(appointResult);
+        //6,验证码删除
+        redisTemplate.delete(SystemCode.CANCEL_CODE_PHONE_PREFIX + phone);
+        log.info("取消预约："+phone+"取消成功:"+appointId);
+        log.warn("取消预约："+phone+"取消成功:"+appointId);
+        return Result.success();
+    }
+
+
+    public Appoint getAppointByID(String appointId, String phone) {
+        Appoint appoint = (Appoint) redisTemplate.boundHashOps(Appoint.class.getName()).get(appointId);
+        boolean hasKey = redisTemplate.hasKey(Appoint.class.getName());
+        if(appoint==null){
+            //双重判断
+            appoint = (Appoint) redisTemplate.boundHashOps(Appoint.class.getName()).get(appointId);
+            if(appoint == null && hasKey == false){
+                //判断有无预约次数 有则有数据
+                BoundHashOperations appointTwoOps = redisTemplate.boundHashOps(SystemCode.USER_APPOINT_RECORD_LIMIT);
+                Object user_is_limit = appointTwoOps.get(phone);
+                int anInt = Integer.parseInt(user_is_limit == null ? "0" : user_is_limit.toString());
+                if(anInt>0){
+                    List<Appoint> allAppointDB = getAllAppointDB(1);
+                    for (Appoint app : allAppointDB) {
+                        if(appointId.equals(app.getAppointId())){
+                            appoint = app;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        return appoint;
+    }
+
+    private ReturnAppointResult isCancelAppoint(Appoint appoint) {
+        SimpleDateFormat sdf1 = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+        SimpleDateFormat sdf2= new SimpleDateFormat("yyyy-MM-dd");
+        ReturnAppointResult result = new ReturnAppointResult();
+        boolean isCan = false;
+        boolean isToday = false;
+        String companyId = appoint.getCompanyId();
+        //获取公司
+        List<Company> companies = (List<Company>) getAllCompany().getObj();
+        List<ManageConfigure> configures = getCompanyAllDetailDB( 1);
+        List<ConfigureTimeSlot> configureTimeSlots = getConfigureTimeSlot(1);
+        String companyType = null;
+        String configureTimeType = null;
+        Date dbtime = null;
+        //找到公司
+        for (Company company : companies) {
+            if(company.getCompanyId().equals(companyId)){
+                result.setCompany(company);
+                companyType = company.getCompanyType();
+                break;
+            }
+        }
+        //找到对应的发布信息
+        for (ManageConfigure configure : configures){
+            if (configure.getId().equals(appoint.getConfigureId())) {
+                //判断该场发布有无过期
+                result.setManageConfigure(configure);
+                configureTimeType = configure.getConfigureTimeType();
+                dbtime = configure.getDbtime();
+                break;
+            }
+        }
+        //找到预约的时间段
+        Date compareDate = null;
+        for (ConfigureTimeSlot timeSlot : configureTimeSlots) {
+            if(timeSlot.getConfigureTimeType().equals(configureTimeType)&&timeSlot.getCompanyType().equals(companyType)){
+                //与当前时间比较
+                try {
+                    compareDate = sdf1.parse(sdf2.format(dbtime)+" "+timeSlot.getEndTime());
+                } catch (ParseException e) {
+                    e.printStackTrace();
+                }
+                result.setTimeSlot(timeSlot);
+                break;
+            }
+        }
+        if(compareDate != null){
+            isCan = compareDate.getTime() > System.currentTimeMillis()+SystemCode.CANCEL_APPOINT_OVERTIME*60*1000;
+            isToday = sdf2.format(compareDate).equals(sdf2.format(new Date()));
+        }
+        result.setAppoint(appoint);
+        result.setIsCan(isCan);
+        result.setIsToday(isToday);
+        return result;
+    }
+}

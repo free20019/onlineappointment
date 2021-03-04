@@ -1,0 +1,206 @@
+package com.twkf.service;
+
+import com.twkf.dao.ManageConfigureDao;
+import com.twkf.domain.Appoint;
+import com.twkf.domain.Company;
+import com.twkf.domain.ConfigureTimeSlot;
+import com.twkf.domain.ManageConfigure;
+import com.twkf.util.IPV4Util;
+import com.twkf.util.SystemCode;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Component;
+import org.springframework.stereotype.Service;
+
+import java.text.ParseException;
+import java.text.SimpleDateFormat;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.List;
+import java.util.concurrent.TimeUnit;
+
+/**
+ * @author: xianlehuang
+ * @Description: 定时任务
+ * @date: 2021/1/29 - 9:57
+ */
+@Service
+@Slf4j
+@Component
+public class ScheduledService {
+
+    @Autowired
+    AppointService appointService;
+
+    @Autowired
+    RedisTemplate redisTemplate;
+
+    @Autowired
+    ManageConfigureDao manageConfigureDao;
+
+    @Autowired
+    private JobService jobService;
+
+    @Value("${spring.application.name}")
+    private String serviceName;
+
+    @Value("${swagger.title}")
+    private String title;
+
+    //查询公司信息 公司发布预约信息
+    //每分钟一次
+    @Scheduled(cron = "0 * * * * *")
+    public void getMinute(){
+        //限制只有一个服务可以执行
+        if (!IPV4Util.ipCompare(jobService.serviceUrl(serviceName))) {
+            return;
+        }
+        log.info("执行定时任务：每分钟一次："+title+"服务,地址为："+IPV4Util.getIpAddress());
+        //公司信息
+        List<Company> companies = appointService.getAllCompanyDB(0);
+        //公司发布的预约信息（今天之后）
+        List<ManageConfigure> ManageConfiguresNotToday = appointService.getCompanyDetailDB(null, 0);
+        //公司发布的预约信息（全部）
+        appointService.getCompanyAllDetailDB( 0);
+        //预约信息
+        List<Appoint> appoints = appointService.getAllAppointDB(0);
+        //时间配置
+        List<ConfigureTimeSlot> configureTimeSlots = appointService.getConfigureTimeSlot(0);
+//        //处理redis用户队列
+//        dealRedisUserQueue(appoints, null,null, ManageConfiguresNotToday, null);
+        log.info("执行定时任务：每分钟一次--执行成功");
+    }
+
+    //查询访问量
+    //每5分钟一次
+    @Scheduled(cron = "0 */5 * * * *")
+    public void getVisit(){
+        //限制只有一个服务可以执行
+        if (!IPV4Util.ipCompare(jobService.serviceUrl(serviceName))) {
+            return;
+        }
+        log.info("执行定时任务：每5分钟一次："+title+"服务,地址为："+IPV4Util.getIpAddress());
+        List values = redisTemplate.boundHashOps(SystemCode.VISIT_NUMBER).values();
+        if(values!=null){
+            redisTemplate.delete(SystemCode.VISIT_NUMBER);
+            manageConfigureDao.visit(values.size());
+        }
+        log.info("执行定时任务：每5分钟一次--执行成功");
+    }
+
+    //查询用户预约信息
+    //每一天一次
+    @Scheduled(cron = "0 0 0 * * *")
+    public void getDay(){
+        //限制只有一个服务可以执行
+        if (!IPV4Util.ipCompare(jobService.serviceUrl(serviceName))) {
+            return;
+        }
+        log.info("执行定时任务：每一天一次："+title+"服务,地址为："+IPV4Util.getIpAddress());
+        //公司信息
+        List<Company> companies = appointService.getAllCompanyDB(0);
+        //获取公司发布预约信息
+        //今天
+        List<ManageConfigure> ManageConfiguresToday = appointService.getCompanyDetailDB(null, 2);
+        //不包含今天
+        List<ManageConfigure> ManageConfiguresNotToday = appointService.getCompanyDetailDB(null, 0);
+        //获取时间配置
+        List<ConfigureTimeSlot> configureTimeSlots = appointService.getConfigureTimeSlot(0);
+
+        //停止预约
+        redisTemplate.opsForValue().set(SystemCode.STOP_APPOINT, true, 30L, TimeUnit.SECONDS);
+        //让相关接口执行完成
+        try {
+            Thread.sleep(2000);
+        } catch (InterruptedException e) {
+            e.printStackTrace();
+        }
+        //用户预约次数->redis
+        List<HashMap<String, Object>> phoneCount = manageConfigureDao.findPhoneCount();
+        HashMap<Object, Object> hashMap = new HashMap<>();
+        for (HashMap<String, Object> map : phoneCount) {
+            hashMap.put(String.valueOf(map.get("phone")), map.get("count"));
+        }
+        redisTemplate.delete(SystemCode.USER_APPOINT_RECORD_LIMIT);
+        redisTemplate.boundHashOps(SystemCode.USER_APPOINT_RECORD_LIMIT).putAll(hashMap);
+
+        //获取用户预约记录
+        List<Appoint> appoints = appointService.getAllAppointDB(0);
+        //处理redis用户队列
+        dealRedisUserQueue(appoints, companies, ManageConfiguresToday, ManageConfiguresNotToday, configureTimeSlots);
+        //开始预约
+        redisTemplate.delete(SystemCode.STOP_APPOINT);
+        log.info("执行定时任务：每一天一次--执行成功");
+    }
+
+    private void dealRedisUserQueue(List<Appoint> appoints, List<Company> companies, List<ManageConfigure> ManageConfiguresToday, List<ManageConfigure> ManageConfiguresNotToday, List<ConfigureTimeSlot> configureTimeSlots) {
+        redisTemplate.delete(SystemCode.USER_APPOINTED_PREFIX);
+        if(ManageConfiguresToday!=null){
+            for (ConfigureTimeSlot timeSlot : configureTimeSlots) {
+                redisTemplate.delete(SystemCode.TODAY_USER_APPOINTED_PREFIX+timeSlot.getCompanyType()+SystemCode.TODAY_USER_APPOINTED_TYPE+timeSlot.getConfigureTimeType());
+            }
+        }
+        for (Appoint appoint : appoints) {
+            //如果用户不在今天预约的，直接存放在redis中
+            for (ManageConfigure notTodayConfigure : ManageConfiguresNotToday) {
+                if(appoint.getConfigureId().equals(notTodayConfigure.getId())){
+                    if(!"2".equals(appoint.getAppointType())){
+                        redisTemplate.boundSetOps(SystemCode.USER_APPOINTED_PREFIX).add(appoint.getPhone());
+                    }
+                }
+            }
+            //如果用户在今天预约的，根据公司类型和时间类型存放在redis中
+            if(ManageConfiguresToday!=null){
+                for (Company company : companies) {
+                    if(company.getCompanyId().equals(appoint.getCompanyId())){
+                        for (ManageConfigure todayConfigure : ManageConfiguresToday) {
+                            if(appoint.getConfigureId().equals(todayConfigure.getId())){
+                                for (ConfigureTimeSlot timeSlot : configureTimeSlots) {
+                                    if(todayConfigure.getConfigureTimeType().equals(timeSlot.getConfigureTimeType())&&company.getCompanyType().equals(timeSlot.getCompanyType())){
+                                        if(!"2".equals(appoint.getAppointType())){
+                                            redisTemplate.boundSetOps(SystemCode.TODAY_USER_APPOINTED_PREFIX+timeSlot.getCompanyType()+SystemCode.TODAY_USER_APPOINTED_TYPE+todayConfigure.getConfigureTimeType()).add(appoint.getPhone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+            }
+        }
+        if(configureTimeSlots!=null){
+            for (ConfigureTimeSlot timeSlot : configureTimeSlots) {
+                //计算超时时长（秒）
+                long time = calculationTimeout(timeSlot.getEndTime());
+                //设置过期时间
+                if(redisTemplate.hasKey(SystemCode.TODAY_USER_APPOINTED_PREFIX+timeSlot.getCompanyType()+SystemCode.TODAY_USER_APPOINTED_TYPE+timeSlot.getConfigureTimeType())){
+                    redisTemplate.expire(SystemCode.TODAY_USER_APPOINTED_PREFIX+timeSlot.getCompanyType()+SystemCode.TODAY_USER_APPOINTED_TYPE+timeSlot.getConfigureTimeType(), time, TimeUnit.SECONDS);
+                }
+            }
+        }
+    }
+
+    //过期时间(秒)
+    private long calculationTimeout(String endTime) {
+        SimpleDateFormat sdf1 = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+        SimpleDateFormat sdf2= new SimpleDateFormat("yyyy-MM-dd");
+        Long seconds = 0L;
+        /*秒数差*/
+        String today = sdf2.format(new Date());
+        Date compareDate = null;
+        try {
+            compareDate = sdf1.parse(today+" "+endTime);
+        } catch (ParseException e) {
+            e.printStackTrace();
+        }
+        if(System.currentTimeMillis()<=compareDate.getTime()){
+            seconds = (((compareDate.getTime()) - System.currentTimeMillis()) / (1000));
+        }
+        return seconds;
+    }
+
+}

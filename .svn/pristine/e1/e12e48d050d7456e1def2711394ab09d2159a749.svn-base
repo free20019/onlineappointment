@@ -1,0 +1,203 @@
+package com.twkf;
+
+import com.twkf.domain.Appoint;
+import com.twkf.domain.ManageConfigure;
+import com.twkf.mapper.*;
+import com.twkf.service.AppointService;
+import com.twkf.service.ScheduledService;
+import com.twkf.service.UserService;
+import com.twkf.util.MessageUtil;
+import com.twkf.util.SystemCode;
+import com.twkf.util.UUIDUtil;
+import com.twkf.vo.AppointVo;
+import com.twkf.vo.Result;
+import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.data.redis.core.BoundHashOperations;
+import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.test.context.junit4.SpringRunner;
+
+import java.time.Duration;
+import java.time.Instant;
+import java.util.Date;
+import java.util.Random;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
+
+import static java.util.concurrent.TimeUnit.*;
+
+/**
+ * @author: xianlehuang
+ * @Description: 测试类
+ * @date: 2021/2/1 - 16:51
+ */
+@RunWith(SpringRunner.class)
+@SpringBootTest
+public class ProviderAppointServerTest {
+
+    @Autowired
+    CompanyMapper companyMapper;
+
+    @Autowired
+    ManageConfigureMapper manageConfigureMapper;
+
+    @Autowired
+    AppointMapper appointMapper;
+
+    @Autowired
+    PhoneCodeMapper phoneCodeMapper;
+
+    @Autowired
+    RedisTemplate redisTemplate;
+
+    @Autowired
+    AppointService appointService;
+
+    @Autowired
+    UserService userService;
+
+    @Autowired
+    ScheduledService scheduledService;
+
+    @Autowired
+    MessageAppointMapper messageAppointMapper;
+
+    @Autowired
+    AppointErrorMapper appointErrorMapper;
+
+
+    //发布预约多少场次 一天一场
+    public static final Integer count = SystemCode.APPOINT_END_DAY;
+
+    //抢票的人
+    public static final Integer persons = 1000;
+
+    //删除redis所有的key  数据库相关测试
+    @Test
+    public void deleteAllKeys(){
+        Set<String> keys = redisTemplate.keys("*");
+        redisTemplate.delete(keys);
+        appointMapper.delete(null);
+        manageConfigureMapper.delete(null);
+        messageAppointMapper.delete(null);
+        appointErrorMapper.delete(null);
+    }
+
+
+    //发布预约信息
+    @Test
+    public void manageConfigure(){
+        ManageConfigure manageConfigure = new ManageConfigure();
+        manageConfigure.setCompanyId("20");
+        manageConfigure.setOrderNumber(10);
+        manageConfigure.setSurplusNumber(10);
+        for (int i = SystemCode.APPOINT_START_DAY; i <= count; i++) {
+            Instant day = Instant.now().plus(Duration.ofDays(i));//几天后
+            manageConfigure.setDbtime(Date.from(day));
+            manageConfigure.setConfigureTimeType((i%5==0?5:i%5)+"");
+            int insert = manageConfigureMapper.insert(manageConfigure);
+            if(i==SystemCode.APPOINT_START_DAY){
+                redisTemplate.opsForValue().set("startId",manageConfigure.getId());
+            }
+            if(insert>0){
+                Appoint appoint = new Appoint();
+                for (int j = 0; j < 10; j++) {
+                    appoint.setCompanyId(manageConfigure.getCompanyId());
+                    appoint.setConfigureId(manageConfigure.getId());
+                    appoint.setAppointId(UUIDUtil.Uuid());
+                    int insert1 = appointMapper.insert(appoint);
+                    if(insert1>0){
+                        try {
+                            redisTemplate.boundListOps(SystemCode.APPOINT_PREFIX+appoint.getConfigureId()).leftPush(appoint.getAppointId());
+                        }catch (Exception e){
+                        }
+                    }
+                }
+            }
+
+        }
+
+    }
+
+    //手机验证码
+    @Test
+    public void getPhoneCode(){
+        Long number = 17000000000L;
+        String code = "1111";
+        String phone = "";
+        for (int i = 0; i < persons; i++) {
+            phone = number + i+ "";
+            redisTemplate.opsForValue().set(SystemCode.CODE_PHONE_PREFIX+phone, code, SystemCode.PHONE_CODE_OVERTIME*60, SECONDS);
+        }
+    }
+
+
+    //预约单个
+    @Test
+    public void appointOne(){
+        Long number = 17000000000L;
+        AppointVo appointVo = new AppointVo();
+        appointVo.setCode("1111");
+        appointVo.setCompanyId("200");
+        String phone = (number+1)+"";
+        Integer startId = Integer.parseInt(redisTemplate.opsForValue().get("startId").toString());
+        appointVo.setId(startId+0+"");
+        appointVo.setPhone(phone);
+        appointVo.setUsername("测试"+phone);
+        Result result = appointService.userAppoint(appointVo.getPhone(), appointVo);
+        System.out.println(result);
+    }
+
+    //预约高并发
+    @Test
+    public void appoints(){
+        Long number = 17000000000L;
+        AppointVo appointVo = new AppointVo();
+        appointVo.setCode("1111");
+        appointVo.setCompanyId("20");
+        Integer startId = Integer.parseInt(redisTemplate.opsForValue().get("startId").toString());
+        for (int j = 0; j < 100; j++) {
+            try {
+                Thread.sleep(1000);
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+            }
+            new Thread(() -> {
+                for (int i = 0; i < persons; i++) {
+                    String phone =  number + i+ "";
+                    appointVo.setId((new Random().nextInt(count+1)+startId)+"");
+                    appointVo.setPhone(phone);
+                    appointVo.setUsername("测试"+phone);
+                    Result result = appointService.userAppoint(appointVo.getPhone(), appointVo);
+//                    System.out.println("--------------------------------------------:"+result);
+                }
+            },"线程"+j).start();
+        }
+    }
+
+    //一键操作
+    @Test
+    public void alls(){
+        deleteAllKeys();
+        manageConfigure();
+        getPhoneCode();
+        appoints();
+    }
+
+    //短息接口
+    @Test
+    public void sendMessage(){
+        String code = String.format("%06d",new Random().nextInt(1000000));
+//        for (int i = 0; i < 100; i++) {
+//            System.out.println(String.format("%06d", new Random().nextInt(1000000)));
+//        }
+        MessageUtil.sendMessage("17826855790","验证码："+code+", 请在3分钟内使用，过期无效。");
+    }
+
+    @Test
+    public void test(){
+
+    }
+}

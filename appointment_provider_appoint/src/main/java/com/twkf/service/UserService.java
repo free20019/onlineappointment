@@ -1,0 +1,155 @@
+package com.twkf.service;
+
+import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
+import com.twkf.annotation.RedissonLock;
+import com.twkf.domain.Company;
+import com.twkf.domain.PhoneCode;
+import com.twkf.domain.User;
+import com.twkf.exception.GlobalException;
+import com.twkf.mapper.PhoneCodeMapper;
+import com.twkf.mapper.UserMapper;
+import com.twkf.util.MessageUtil;
+import com.twkf.util.SystemCode;
+import com.twkf.util.UUIDUtil;
+import com.twkf.vo.LoginVo;
+import com.twkf.vo.Result;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.stereotype.Component;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+import java.text.SimpleDateFormat;
+import java.util.Date;
+import java.util.Random;
+import java.util.concurrent.TimeUnit;
+
+/**
+ * @author: xianlehuang
+ * @Description:
+ * @date: 2021/1/27 - 15:13
+ */
+@Service
+@Slf4j
+@Component
+public class UserService {
+
+    @Autowired
+    UserMapper userMapper;
+
+    @Autowired
+    PhoneCodeMapper phoneCodeMapper;
+
+    @Autowired
+    RedisTemplate redisTemplate;
+
+    @Value("${spring.profiles.active}")
+    private String activeTemp;
+
+    public Result login(HttpServletRequest request, HttpServletResponse response, LoginVo loginVo) {
+        if (loginVo == null) {
+            throw new GlobalException("用户信息为空!!");
+        }
+        String formPass = loginVo.getPassword();
+
+        // 判断用户否存在
+        User user = userMapper.selectOne(new QueryWrapper<User>().eq("phone", loginVo.getPhone()));
+        if (user == null) {
+            throw new GlobalException("用户不存在");
+        }
+        // 验证密码
+        String PassDB = user.getPassword();
+        if (!formPass.equals(PassDB)) {
+            throw new GlobalException("密码错误");
+        }
+        String token = UUIDUtil.Uuid();
+//        addCookie(response, token, user);
+//        insertLoginHistory(username);
+        return Result.success();
+    }
+
+    @Transactional
+    //type 0:预约  1：取消预约
+    @RedissonLock(lockIndex = 0)
+    public Result getPhoneCode(String phone, Integer type) {
+        String prefix;
+        Integer overtime;
+        if(type==0){
+            prefix = SystemCode.CODE_PHONE_PREFIX;
+            overtime = SystemCode.PHONE_CODE_OVERTIME;
+        }else if(type==1){
+            prefix = SystemCode.CANCEL_CODE_PHONE_PREFIX;
+            overtime = SystemCode.PHONE_CODE_OVERTIME;
+        }else{
+            return Result.error();
+        }
+        //判断是否存在有效的验证码
+        String redisCode = (String) redisTemplate.opsForValue().get(prefix + phone);
+        if(redisCode != null){
+            return Result.error("验证码已经发送了！");
+        }
+
+        String code = String.format("%06d",new Random().nextInt(1000000));
+        //获取短信验证码
+        Result result = MessageUtil.sendMessage(phone, "验证码：" + code + ", 请在" + overtime + "分钟内使用，过期无效。");
+        //短信入库
+        if("test".equals(activeTemp)||result.getCode()==200){
+            log.info("验证码接口："+phone+"验证码：",code);
+            //把短息验证码入库
+//            PhoneCode phoneCode = new PhoneCode();
+//            phoneCode.setPhone(phone);
+//            phoneCode.setCode(code);
+//            phoneCode.setOverdueTime(new Date());
+//            phoneCode.setOverdueTime(new Date(System.currentTimeMillis()+ overtime*60*1000));
+//            phoneCode.setType(type+"");
+//            int insert = phoneCodeMapper.insert(phoneCode);
+//            if(insert>0){
+                redisTemplate.opsForValue().set(prefix+phone, code, overtime*60, TimeUnit.SECONDS);
+                if("test".equals(activeTemp)){
+                    return Result.success(code);
+                }else{
+                    return Result.success();
+                }
+//            }else{
+//                return Result.error();
+//            }
+        }else{
+            log.info("验证码接口："+phone+"验证码短息发送失败:"+result.getMessage());
+            return Result.error("验证码短息发送失败！！");
+        }
+    }
+
+    //type 0:预约  1：取消预约
+//    @RedissonLock(lockIndex = 0)
+    public Result CheckPhoneCode(String phone, String username, String code, Integer type) {
+        String prefix;
+        if(type==0){
+            prefix = SystemCode.CODE_PHONE_PREFIX;
+        }else if(type==1){
+            prefix = SystemCode.CANCEL_CODE_PHONE_PREFIX;
+        }else{
+            return Result.error();
+        }
+        String redisCode = (String) redisTemplate.opsForValue().get(prefix + phone);
+        if(redisCode == null){
+            log.info("校验验证码："+phone+"无效验证码,请重新发送！");
+            return Result.error("无效验证码,请重新发送！");
+        }else if(code.equals(redisCode)){
+            return Result.success();
+        }else{
+            log.info("校验验证码："+"验证码接口："+phone+"验证码错误");
+            return Result.error("验证码错误！");
+        }
+
+    }
+
+    public Result visit() {
+        SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+        redisTemplate.boundHashOps(SystemCode.VISIT_NUMBER).put(UUIDUtil.Uuid(),sdf.format(new Date()));
+        return Result.success();
+    }
+}

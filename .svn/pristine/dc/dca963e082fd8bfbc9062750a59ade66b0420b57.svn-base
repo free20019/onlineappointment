@@ -1,0 +1,524 @@
+package com.twkf.service;
+
+import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
+import com.twkf.dao.ManageConfigureDao;
+import com.twkf.domain.*;
+import com.twkf.mapper.*;
+import com.twkf.util.MessageUtil;
+import com.twkf.util.SystemCode;
+import com.twkf.vo.Result;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.data.redis.core.BoundHashOperations;
+import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.scheduling.annotation.Async;
+import org.springframework.stereotype.Service;
+import sun.plugin.util.UIUtil;
+
+import java.text.SimpleDateFormat;
+import java.util.Date;
+import java.util.List;
+import java.util.UUID;
+
+/**
+ * @author: xianlehuang
+ * @Description:
+ * @date: 2021/2/3 - 15:49
+ */
+@Service
+@Slf4j
+public class AsyncService {
+
+    @Autowired
+    CompanyMapper companyMapper;
+
+    @Autowired
+    ManageConfigureMapper manageConfigureMapper;
+
+    @Autowired
+    ManageConfigureDao manageConfigureDao;
+
+    @Autowired
+    AppointMapper appointMapper;
+
+    @Autowired
+    ConfigureTimeSlotMapper configureTimeSlotMapper;
+
+    @Autowired
+    MessageAppointMapper messageAppointMapper;
+
+    @Autowired
+    UserService userService;
+
+    @Autowired
+    AppointService appointService;
+
+    @Autowired
+    RedisTemplate redisTemplate;
+
+    @Autowired
+    AppointErrorMapper appointErrorMapper;
+
+    //用户预约
+    @Async
+    public void dealAppointRecord(Appoint appoint){
+        //判断是否为 null
+        if(appoint != null){
+            SimpleDateFormat sdf= new SimpleDateFormat("yyyy年MM月dd日");
+            String configureId = appoint.getConfigureId();
+            String phone = appoint.getPhone();
+            String companyId = appoint.getCompanyId();
+            String username = appoint.getUsername();
+            String appointId = appoint.getAppointId();
+            List<Company> companies = (List<Company>) appointService.getAllCompany().getObj();
+            List<ConfigureTimeSlot> configureTimeSlots = appointService.getConfigureTimeSlot(1);
+            ManageConfigure configure = (ManageConfigure) appointService.getCompanyDetailById(configureId).getObj();
+            //更新预约记录
+            int appoint_id = 0;
+            try {
+                //不是null，将预约记录存入数据库
+                appoint_id = appointMapper.update(appoint, new QueryWrapper<Appoint>()
+                        .eq("appoint_id", appointId)
+                        .eq("configure_id", configureId)
+                        .eq("appoint_type",0)
+                );
+            }catch (Exception e){
+                e.printStackTrace();
+                log.info("用户预约异步接口："+phone+"记录预约为"+configureId+"的入库异常:", e);
+            }
+            //预约id数量减1,更新数据库
+            int update = 0;
+            try {
+                update = manageConfigureDao.updateByIncrease(configureId,-1);
+            }catch (Exception e){
+                e.printStackTrace();
+                log.info("用户预约异步接口："+phone+"用户预约后库存更新失败id"+configureId+"的入库异常:", e);
+            }
+            //将预约记录存入到redis
+            redisTemplate.boundHashOps(Appoint.class.getName()).put(appointId, appoint);
+            if(update==0){
+                log.info("用户预约异步接口："+phone+"用户预约后库存更新失败id:",configureId);
+                log.warn("用户预约异步接口："+phone+"用户预约后库存更新失败id:",configureId);
+            }
+            if(appoint_id==0){
+                AppointError error = new AppointError();
+                error.setAppointId(appoint.getAppointId());
+                error.setConfigureId(appoint.getConfigureId());
+                error.setCompanyId(appoint.getCompanyId());
+                error.setAppointTime(appoint.getAppointTime());
+                error.setAppointType(appoint.getAppointType());
+                error.setPhone(appoint.getPhone());
+                error.setUsername(appoint.getUsername());
+                error.setCode(appoint.getCode());
+                int insert_error = 0;
+                try {
+                    insert_error = appointErrorMapper.insert(error);
+                }catch (Exception e){
+                    log.info("用户预约异步接口："+phone+"用户预约入库错误插入错误:"+error);
+                }
+                if(insert_error==0){
+                    log.info("用户预约异步接口："+phone+"用户预约入库错误插入失败:"+error);
+                }
+                log.info("用户预约异步接口："+phone+"用户预约记录更新失败:",appoint);
+                log.warn("用户预约异步接口："+phone+"用户预约记录更新失败:",appoint);
+            }
+            try {
+                //判断预约为id的数量是否小于0
+                if(configure.getSurplusNumber()>0){
+                    //配置预约id数量减1,更新redis缓存
+                    configure.setSurplusNumber(configure.getSurplusNumber() - 1);
+                    redisTemplate.boundHashOps(ManageConfigure.class.getName()).put(configure.getId(), configure);
+                }
+            }catch (Exception e){
+                e.printStackTrace();
+                log.info("用户预约异步接口："+phone+"redis记录预约为"+configureId+"的数量异常:", e);
+            }
+            //短息发送
+            MessageAppoint messageAppoint = new MessageAppoint();
+            messageAppoint.setPhone(phone);
+            messageAppoint.setCompanyId(companyId);
+            messageAppoint.setConfigureId(configureId);
+            messageAppoint.setCreateTime(new Date());
+            messageAppoint.setIsSuccess("0");
+            messageAppoint.setErrorReason("");
+            messageAppoint.setType("0");
+            for (Company company : companies) {
+                if(company.getCompanyId().equals(companyId)){
+                    for (ConfigureTimeSlot timeSlot : configureTimeSlots) {
+                        if(timeSlot.getCompanyType().equals(company.getCompanyType())&&timeSlot.getConfigureTimeType().equals(configure.getConfigureTimeType())){
+                            String message = username + " 已成功预约，" +
+                                    "请携带相关材料于" + sdf.format(configure.getDbtime()) + " " + timeSlot.getTimeSlot() + "" +
+                                    " ，到 " + company.getCompanyAddress() + "/" + company.getCompanyName() + "办理，咨询电话" + company.getCompanyPhone() + "。" +
+                                    "现场请出示预约记录或预约短信，逾期可能无法办理。";
+                            Result result = MessageUtil.sendMessage(phone, message);
+                            //短信入库
+                            messageAppoint.setMessage(message);
+                            messageAppoint.setAppointSuccess("0");
+                            if(result.getCode()!=200){
+                                messageAppoint.setIsSuccess("1");
+                                messageAppoint.setErrorReason(result.getMessage());
+                            }
+                            messageAppointMapper.insert(messageAppoint);
+                            break;
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    //取消预约
+    @Async
+    public void dealCancelAppointRecord(ReturnAppointResult appointResult) {
+        SimpleDateFormat sdf= new SimpleDateFormat("yyyy年MM月dd日");
+
+        Appoint appoint = appointResult.getAppoint();
+        ManageConfigure manageConfigure = appointResult.getManageConfigure();
+        Company company = appointResult.getCompany();
+        String username = appoint.getUsername();
+        String phone = appoint.getPhone();
+        String appointId = appoint.getAppointId();
+        String configureId = appoint.getConfigureId();
+        String companyId = appoint.getCompanyId();
+        //1,更新预约记录为已取消
+        appoint.setAppointType("2");
+        int appoint_id = 0;
+        try {
+            //不是null，将预约记录存入数据库
+            appoint_id = appointMapper.update(appoint, new QueryWrapper<Appoint>()
+                    .eq("appoint_id", appointId)
+                    .eq("configure_id", configureId)
+                    .eq("appoint_type",1)
+            );
+        }catch (Exception e){
+            e.printStackTrace();
+            log.info("取消预约异步接口："+phone+"取消预约uuid为"+appointId+"的入库异常:", e);
+        }
+
+        //2,更新预约场次的预约数加1
+        int update = 0;
+        try {
+            update = manageConfigureDao.updateByIncrease(configureId,1);
+        }catch (Exception e){
+            e.printStackTrace();
+            log.info("取消预约异步接口："+phone+"取消预约场id为"+configureId+"的异常:", e);
+        }
+        if(update==0){
+            log.info("取消预约异步接口："+phone+"取消预约场id为"+configureId+"的失败！");
+        }
+
+        //3,在预约表中再加一条预约信息
+        String newAppointId = String.valueOf(UUID.randomUUID());
+        Appoint newAppoint = new Appoint();
+        newAppoint.setConfigureId(configureId);
+        newAppoint.setCompanyId(companyId);
+        newAppoint.setAppointType("0");
+        newAppoint.setAppointId(newAppointId);
+        int insert = 0;
+        try {
+            insert = appointMapper.insert(newAppoint);
+        }catch (Exception e){
+            e.printStackTrace();
+            log.info("取消预约异步接口："+phone+"添加一条预约信息异常:", e);
+        }
+        if(insert==0){
+            log.info("取消预约异步接口："+phone+"添加一条预约信息失败:"+newAppoint);
+        }
+        //(更新数据库之后)
+        //4,预约记录redis设置已取消
+        redisTemplate.boundHashOps(Appoint.class.getName()).put(appointId, appoint);
+        //5,重新放入‘预约记录id’
+        redisTemplate.boundListOps(SystemCode.APPOINT_PREFIX+configureId).leftPush(newAppointId);
+        //6,预约配置加一
+        manageConfigure.setSurplusNumber(manageConfigure.getSurplusNumber() + 1);
+        redisTemplate.boundHashOps(ManageConfigure.class.getName()).put(configureId, manageConfigure);
+
+        //更新预约记录失败，插入到失败表中
+        if(appoint_id==0){
+            AppointError error = new AppointError();
+            error.setAppointId(appoint.getAppointId());
+            error.setConfigureId(appoint.getConfigureId());
+            error.setCompanyId(appoint.getCompanyId());
+            error.setAppointTime(appoint.getAppointTime());
+            error.setAppointType(appoint.getAppointType());
+            error.setPhone(appoint.getPhone());
+            error.setUsername(appoint.getUsername());
+            error.setCode(appoint.getCode());
+            int insert_error = 0;
+            try {
+
+                insert_error = appointErrorMapper.insert(error);
+            }catch (Exception e){
+                log.info("取消预约异步接口："+phone+"用户取消预约入库错误插入错误:",error);
+            }
+            if(insert_error==0){
+                log.info("取消预约异步接口："+phone+"用户取消预约入库错误插入失败:"+error);
+            }
+            log.info("取消预约异步接口："+phone+"用户取消预约的记录更新失败:",appoint);
+            log.warn("取消预约异步接口："+phone+"用户取消预约的记录更新失败:",appoint);
+        }
+        //短息发送
+        MessageAppoint messageAppoint = new MessageAppoint();
+        messageAppoint.setPhone(phone);
+        messageAppoint.setCompanyId(companyId);
+        messageAppoint.setConfigureId(configureId);
+        messageAppoint.setCreateTime(new Date());
+        messageAppoint.setIsSuccess("0");
+        messageAppoint.setErrorReason("");
+        messageAppoint.setType("1");
+        List<ConfigureTimeSlot> configureTimeSlots = appointService.getConfigureTimeSlot(1);
+        for (ConfigureTimeSlot timeSlot : configureTimeSlots) {
+            if(timeSlot.getCompanyType().equals(company.getCompanyType())&&timeSlot.getConfigureTimeType().equals(manageConfigure.getConfigureTimeType())){
+                String message = username + " 您已成功取消原定于" +
+                        sdf.format(manageConfigure.getDbtime()) + " " + timeSlot.getTimeSlot()  +
+                        "窗口人工办理小客车区域指标申请业务的预约。";
+                Result result = MessageUtil.sendMessage(phone, message);
+                //短信入库
+                messageAppoint.setMessage(message);
+                messageAppoint.setAppointSuccess("0");
+                if(result.getCode()!=200){
+                    messageAppoint.setIsSuccess("1");
+                    messageAppoint.setErrorReason(result.getMessage());
+                }
+                messageAppointMapper.insert(messageAppoint);
+                break;
+            }
+        }
+    }
+
+//    //用户预约
+//    @Async
+//    public void dealAppointRecord(Appoint appoint){
+//        //判断是否为 null
+//        if(appoint != null){
+//            SimpleDateFormat sdf= new SimpleDateFormat("yyyy年MM月dd日");
+//            int appoint_id = 0;
+//            String configureId = appoint.getConfigureId();
+//            String phone = appoint.getPhone();
+//            String companyId = appoint.getCompanyId();
+//            String username = appoint.getUsername();
+//            String appointId = appoint.getAppointId();
+//            //短信
+//            MessageAppoint messageAppoint = new MessageAppoint();
+//            messageAppoint.setPhone(phone);
+//            messageAppoint.setCompanyId(companyId);
+//            messageAppoint.setConfigureId(configureId);
+//            messageAppoint.setCreateTime(new Date());
+//            messageAppoint.setIsSuccess("0");
+//            messageAppoint.setErrorReason("");
+//            messageAppoint.setType("0");
+//            try {
+//                //不是null，将预约记录存入数据库
+//                appoint_id = appointMapper.update(appoint, new QueryWrapper<Appoint>()
+//                        .eq("appoint_id", appointId)
+//                        .eq("configure_id", configureId)
+//                        .eq("appoint_type",0)
+//                );
+//            }catch (Exception e){
+//                e.printStackTrace();
+//                log.info("用户预约异步接口："+phone+"记录预约为"+configureId+"的入库异常:", e);
+//            }
+//            if(appoint_id>=1){
+//                //短息发送
+//                List<Company> companies = (List<Company>) appointService.getAllCompany().getObj();
+//                List<ConfigureTimeSlot> configureTimeSlots = appointService.getConfigureTimeSlot(1);
+//                ManageConfigure configure = (ManageConfigure) appointService.getCompanyDetailById(configureId).getObj();
+//                for (Company company : companies) {
+//                    if(company.getCompanyId().equals(companyId)){
+//                        for (ConfigureTimeSlot timeSlot : configureTimeSlots) {
+//                            if(timeSlot.getCompanyType().equals(company.getCompanyType())&&timeSlot.getConfigureTimeType().equals(configure.getConfigureTimeType())){
+//                                String message = username + " 已成功预约，" +
+//                                        "请携带相关材料于" + sdf.format(configure.getDbtime()) + " " + timeSlot.getTimeSlot() + "" +
+//                                        " ，到 " + company.getCompanyAddress() + "/" + company.getCompanyName() + "办理，咨询电话" + company.getCompanyPhone() + "。" +
+//                                        "现场请出示预约记录或预约短信，逾期可能无法办理。";
+//                                Result result = MessageUtil.sendMessage(phone, message);
+//                                //短信入库
+//                                messageAppoint.setMessage(message);
+//                                messageAppoint.setAppointSuccess("0");
+//                                if(result.getCode()!=200){
+//                                    messageAppoint.setIsSuccess("1");
+//                                    messageAppoint.setErrorReason(result.getMessage());
+//                                }
+//                                messageAppointMapper.insert(messageAppoint);
+//                                break;
+//                            }
+//                        }
+//                        break;
+//                    }
+//                }
+//                //预约id数量减1,更新数据库
+//                int update = manageConfigureDao.updateByIncrease(configureId,-1);
+//                //将预约记录存入到redis
+//                redisTemplate.boundHashOps(Appoint.class.getName()).put(appointId, appoint);
+//                if(update<1){
+//                    log.info("用户预约异步接口："+phone+"用户预约后库存更新失败id:",configureId);
+//                    log.warn("用户预约异步接口："+phone+"用户预约后库存更新失败id:",configureId);
+//                    return;
+//                }
+//            }else{
+//                //重新放入‘预约记录id’
+//                redisTemplate.boundListOps(SystemCode.APPOINT_PREFIX+configureId).leftPush(appointId);
+//                //把用户phone从redis中移除
+//                redisTemplate.boundSetOps(SystemCode.USER_APPOINTED_PREFIX).remove(phone);
+//                //用户预约次数减去一
+//                BoundHashOperations ops = redisTemplate.boundHashOps(SystemCode.USER_APPOINT_RECORD_LIMIT);
+//                ops.put(phone, Integer.parseInt(ops.get(phone)==null?"0":ops.get(phone).toString())-1);
+//                //友好提示
+//                String message = "对不起，你的预约失败了！";
+//                Result result = MessageUtil.sendMessage(phone, message);
+//                //短信入库
+//                messageAppoint.setMessage(message);
+//                messageAppoint.setAppointSuccess("1");
+//                if(result.getCode()!=200){
+//                    messageAppoint.setIsSuccess("1");
+//                    messageAppoint.setErrorReason(result.getMessage());
+//                }
+//                messageAppointMapper.insert(messageAppoint);
+//                log.info("用户预约异步接口："+phone+"用户预约记录更新失败:",appoint);
+//                log.warn("用户预约异步接口："+phone+"用户预约记录更新失败:",appoint);
+//                return;
+//            }
+//            try {
+//                //判断预约为id的数量是否小于0
+//                ManageConfigure configure = (ManageConfigure) appointService.getCompanyDetailById(configureId).getObj();
+//                if(configure.getSurplusNumber()>0){
+//                    //配置预约id数量减1,更新redis缓存
+//                    configure.setSurplusNumber(configure.getSurplusNumber() - 1);
+//                    redisTemplate.boundHashOps(ManageConfigure.class.getName()).put(configure.getId(), configure);
+//                }
+//            }catch (Exception e){
+//                e.printStackTrace();
+//                log.info("用户预约异步接口："+phone+"redis记录预约为"+configureId+"的数量异常:", e);
+//            }
+//        }
+//    }
+//
+//    //取消预约
+//    @Async
+//    public void dealCancelAppointRecord(ReturnAppointResult appointResult) {
+//        Appoint appoint = appointResult.getAppoint();
+//        ManageConfigure manageConfigure = appointResult.getManageConfigure();
+//        Company company = appointResult.getCompany();
+//        SimpleDateFormat sdf= new SimpleDateFormat("yyyy年MM月dd日");
+//        //1,更新预约记录为已取消
+//        int appoint_id = 0;
+//        String username = appoint.getUsername();
+//        String phone = appoint.getPhone();
+//        String appointId = appoint.getAppointId();
+//        String configureId = appoint.getConfigureId();
+//        String companyId = appoint.getCompanyId();
+//        appoint.setAppointType("2");
+//        //短信
+//        MessageAppoint messageAppoint = new MessageAppoint();
+//        messageAppoint.setPhone(phone);
+//        messageAppoint.setCompanyId(companyId);
+//        messageAppoint.setConfigureId(configureId);
+//        messageAppoint.setCreateTime(new Date());
+//        messageAppoint.setIsSuccess("0");
+//        messageAppoint.setErrorReason("");
+//        messageAppoint.setType("1");
+//        try {
+//            //不是null，将预约记录存入数据库
+//            appoint_id = appointMapper.update(appoint, new QueryWrapper<Appoint>()
+//                    .eq("appoint_id", appointId)
+//                    .eq("configure_id", configureId)
+//                    .eq("appoint_type",1)
+//            );
+//        }catch (Exception e){
+//            e.printStackTrace();
+//            log.info("取消预约异步接口："+phone+"取消预约uuid为"+appointId+"的入库异常:", e);
+//        }
+//        if(appoint_id>=1){
+//            //短息发送
+//            List<ConfigureTimeSlot> configureTimeSlots = appointService.getConfigureTimeSlot(1);
+//            for (ConfigureTimeSlot timeSlot : configureTimeSlots) {
+//                if(timeSlot.getCompanyType().equals(company.getCompanyType())&&timeSlot.getConfigureTimeType().equals(manageConfigure.getConfigureTimeType())){
+//                    String message = username + " 您已成功取消原定于" +
+//                            sdf.format(manageConfigure.getDbtime()) + " " + timeSlot.getTimeSlot()  +
+//                            "窗口人工办理小客车区域指标申请业务的预约。";
+//                    Result result = MessageUtil.sendMessage(phone, message);
+//                    //短信入库
+//                    messageAppoint.setMessage(message);
+//                    messageAppoint.setAppointSuccess("0");
+//                    if(result.getCode()!=200){
+//                        messageAppoint.setIsSuccess("1");
+//                        messageAppoint.setErrorReason(result.getMessage());
+//                    }
+//                    messageAppointMapper.insert(messageAppoint);
+//                    break;
+//                }
+//            }
+//
+//            //2,更新预约场次的预约数加1
+//            int update = 0;
+//            try {
+//                update = manageConfigureDao.updateByIncrease(configureId,1);
+//            }catch (Exception e){
+//                e.printStackTrace();
+//                log.info("取消预约异步接口："+phone+"取消预约场id为"+configureId+"的异常:", e);
+//            }
+//            if(update==0){
+//                log.info("取消预约异步接口："+phone+"取消预约场id为"+configureId+"的失败！");
+//            }
+//            //3,在预约表中再加一条预约信息
+//            String newAppointId = String.valueOf(UUID.randomUUID());
+//            Appoint newAppoint = new Appoint();
+//            newAppoint.setConfigureId(configureId);
+//            newAppoint.setCompanyId(companyId);
+//            newAppoint.setAppointType("0");
+//            newAppoint.setAppointId(newAppointId);
+//            int insert = 0;
+//            try {
+//                insert = appointMapper.insert(newAppoint);
+//            }catch (Exception e){
+//                e.printStackTrace();
+//                log.info("取消预约异步接口："+phone+"添加一条预约信息异常:", e);
+//            }
+//            if(insert==0){
+//                log.info("取消预约异步接口："+phone+"添加一条预约信息失败:"+newAppoint);
+//            }
+//            //(更新数据库之后)
+//            //4,预约记录redis设置已取消
+//            redisTemplate.boundHashOps(Appoint.class.getName()).put(appointId, appoint);
+//            //5,重新放入‘预约记录id’
+//            redisTemplate.boundListOps(SystemCode.APPOINT_PREFIX+configureId).leftPush(newAppointId);
+//            //6,预约配置加一
+//            manageConfigure.setSurplusNumber(manageConfigure.getSurplusNumber() + 1);
+//            redisTemplate.boundHashOps(ManageConfigure.class.getName()).put(configureId, manageConfigure);
+//        }else{
+//            //添加用户预约今日或者今日之后的
+//            //是否是今天预约的
+//            if(appointResult.getIsToday()){
+//                //添加用户预约今日的
+//                redisTemplate.boundSetOps(SystemCode.TODAY_USER_APPOINTED_PREFIX+company.getCompanyType()+SystemCode.TODAY_USER_APPOINTED_TYPE+manageConfigure.getConfigureTimeType()).add(phone);
+//            }else {
+//                redisTemplate.boundSetOps(SystemCode.USER_APPOINTED_PREFIX).add(phone);
+//            }
+//            //用户预约次数加一
+//            BoundHashOperations appointTwoOps = redisTemplate.boundHashOps(SystemCode.USER_APPOINT_RECORD_LIMIT);
+//            Object user_is_limit = appointTwoOps.get(phone);
+//            appointTwoOps.put(phone, Integer.parseInt(user_is_limit==null?"0":user_is_limit.toString())+1);
+//            //友好提示
+//            String message = "对不起，你取消预约失败了！";
+//            Result result = MessageUtil.sendMessage(phone, message);
+//            //短信入库
+//            messageAppoint.setMessage(message);
+//            messageAppoint.setAppointSuccess("1");
+//            if(result.getCode()!=200){
+//                messageAppoint.setIsSuccess("1");
+//                messageAppoint.setErrorReason(result.getMessage());
+//            }
+//            messageAppointMapper.insert(messageAppoint);
+//            log.info("取消预约异步接口："+phone+"用户取消预约的记录更新失败:",appoint);
+//            log.warn("取消预约异步接口："+phone+"用户取消预约的记录更新失败:",appoint);
+//        }
+//    }
+
+
+    //更新预约记录
+    @Async
+    public void dealUpdateAppoint(Appoint appoint) {
+        appointMapper.updateById(appoint);
+    }
+}

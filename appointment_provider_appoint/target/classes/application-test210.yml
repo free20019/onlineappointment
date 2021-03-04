@@ -1,0 +1,87 @@
+server:
+  port: 8002
+  context-path: /onlineAppoint
+
+#mybatis:
+#  config-location: classpath:mybatis/mybatis.cfg.xml  #mybatis所在路径
+#  type-aliases-package: com.atguigu.springcloud.entities #entity别名类
+#  mapper-locations:
+#    - classpath:mybatis/mapper/**/*.xml #mapper映射文件
+
+#jdbc
+spring:
+  application:
+    name: appointment_provider_appoint
+  datasource:
+    username: root
+    password: 123456
+    url: jdbc:mysql://192.168.11.33:3307/zxyy?useUnicode=true&characterEncoding=utf-8&allowMultiQueries=true&useSSL=false&serverTimezone=Asia/Shanghai
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    type: com.alibaba.druid.pool.DruidDataSource
+
+    #druid 数据源专有配置
+    initialSize: 5
+    minIdle: 5
+    maxActive: 20
+    maxWait: 60000
+    timeBetweenEvictionRunsMillis: 60000
+    minEvictableIdleTimeMillis: 300000
+    validationQuery: SELECT 1 FROM DUAL
+    testWhileIdle: true
+    testOnBorrow: false
+    testOnReturn: false
+    poolPreparedStatements: true
+    #配置监控统计拦截的filters，stat:监控统计、log4j：日志记录、wall：防御sql注入
+    #如果允许时报错  java.lang.ClassNotFoundException: org.apache.log4j.Priority
+    #则导入 log4j 依赖即可，Maven 地址： https://mvnrepository.com/artifact/log4j/log4j
+    filters: stat,wall,log4j
+    maxPoolPreparedStatementPerConnectionSize: 20
+    useGlobalDataSourceStat: true
+    connectionProperties: druid.stat.mergeSql=true;druid.stat.slowSqlMillis=5000
+    #druid recycle
+    removeAbandoned: true
+    removeAbandonedTimeout: 300
+    logAbandoned: true
+    query-timeout: 90
+
+  redis:
+    host: 127.0.0.1
+    port: 6379
+    password: l
+    timeout: 0
+#    pool:
+#      max-wait: -1
+#      max-idle: 1000
+#      max-active: 10000
+
+# 配置日志
+mybatis-plus.configuration.log-impl: org.apache.ibatis.logging.stdout.StdOutImpl
+
+pagehelper:
+  reasonable: true
+  support-methods-arguments: true
+  params: count=countSql
+
+logging:
+  level:
+    com.twkf.service: INFO
+
+spring.jackson.date-format: yyyy-MM-dd HH:mm:ss
+spring.jackson.time-zone: Asia/Shanghai
+
+eureka:
+  client: #客户端注册进eureka服务列表内
+    service-url:
+      defaultZone: http://127.0.0.1:7000/eureka/
+  instance:
+    instance-id: appointment_provider_appoint_test   #自定义服务名称信息
+    prefer-ip-address: true     #访问路径可以显示IP地址
+
+info:
+  app.name: appointment_provider_appoint
+  company.name: twkj
+  build.artifactId: $project.artifactId$
+  build.version: $project.version$
+
+swagger:
+  title: 服务:在线预约--用户模块, 在线预约-测试210

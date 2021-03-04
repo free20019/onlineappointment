@@ -1,0 +1,67 @@
+package com.twkf.util;
+
+/**
+ * @author: xianlehuang
+ * @Description:
+ * @date: 2021/1/28 - 14:36
+ */
+public class SystemCode {
+
+    //短息接口地址
+    public final static String MESSAGE_URL = "http://60.191.16.73:55115/smsService/http/shortMessage";
+
+    //短信验证失效时间 单位：分钟
+    public final static Integer PHONE_CODE_OVERTIME = 3;
+
+    //redis放入手机号码预约验证码前缀
+    public final static String CODE_PHONE_PREFIX = "CODE_PHONE_PREFIX_";
+
+    //可以预约天数限制 后几天
+    public final static Integer APPOINT_START_DAY = 0;
+    public final static Integer APPOINT_END_DAY = 7;
+
+    //redis用户今日预约提前多少时间 单位：分钟
+    public final static Integer USER_APPOINT_OVERTIME = new Double(0.5*60).intValue();
+
+    //公司信息失效时间 单位：分钟
+    public final static Integer COMPANY_OVERTIME = 2;
+
+    //公司发布预约信息失效时间 单位：分钟
+    public final static Integer MANAGE_CONFIGURE_OVERTIME = 2;
+
+    //预约记录失效时间 单位：分钟
+    public final static Integer APPOINT_RECORD_OVERTIME = 2;
+
+    //时间信息失效时间 单位：分钟
+    public final static Integer CONFIGURE_TIME_SLOT_OVERTIME = 2;
+
+    //redis用户在约天数限制内已预约的前缀
+    public final static String USER_APPOINTED_PREFIX = "USER_APPOINTED_PREFIX";
+
+    //redis用户在今天已预约的前缀 格式（TODAY_USER_APPOINTED_PREFIX+公司类型+&+公司发布的时间类型）
+    public final static String TODAY_USER_APPOINTED_PREFIX = "TODAY_USER_APPOINTED_PREFIX";
+    //不同类型公司的分割符号
+    public final static String TODAY_USER_APPOINTED_TYPE = "&";
+
+    //redis公司发布的预约信息队列的前缀
+    public final static String APPOINT_PREFIX = "appoint_";
+
+    //redis用户抢到预约队列的前缀
+    public final static String SNATCH_APPOINTMENT_PREFIX = "SNATCH_APPOINTMENT_PREFIX_";
+
+    //redis用户已预约次数的限制
+    public final static String USER_APPOINT_RECORD_LIMIT = "USER_APPOINT_RECORD_LIMIT";
+    public final static Integer USER_LIMIT = 3;
+
+    //判断是否可以预约--redis
+    public final static String STOP_APPOINT = "STOP_APPOINT";
+
+    //redis放入手机号码取消预约验证码前缀
+    public final static String CANCEL_CODE_PHONE_PREFIX = "CANCEL_CODE_PHONE_PREFIX_";
+
+    //redis取消预约提前多少时间 单位：分钟
+    public final static Integer CANCEL_APPOINT_OVERTIME = new Double(24*60).intValue();
+
+    //访问量
+    public final static String VISIT_NUMBER = "VISIT_NUMBER";
+}
